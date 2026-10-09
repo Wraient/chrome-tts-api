@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>chrome-tts-api harness</title>
+</head>
+<body>
+  <p id="status">booting…</p>
+  <script>
+    window.__err = [];
+    window.addEventListener('error', (e) => window.__err.push('error: ' + e.message));
+    window.addEventListener('unhandledrejection', (e) => window.__err.push('rejection: ' + (e.reason && e.reason.message || e.reason)));
+  </script>
+  <!-- Order matters: pre-shim, emscripten bindings, factory wrap, engine, api -->
+  <script src="/harness/shim-pre.js"></script>
+  <script src="/harness/bindings_main.js"></script>
+  <script src="/harness/shim-post.js"></script>
+  <script src="/harness/offscreen_compiled.js"></script>
+  <script src="/harness/api.js"></script>
+  <script>
+    window.__ttsReady.then(
+      () => { document.getElementById('status').textContent = 'ready'; },
+      (e) => { document.getElementById('status').textContent = 'error: ' + e; },
+    );
+  </script>
+</body>
+</html>

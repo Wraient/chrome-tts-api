@@ -1,0 +1,10 @@
+{
+  "name": "chrome-tts-api",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Local HTTP API over Chrome's on-device Read Aloud TTS engine",
+  "scripts": {
+    "start": "node server.mjs",
+    "voices": "node tools/download-voices.mjs"
+  }
+}

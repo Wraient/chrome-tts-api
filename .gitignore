@@ -1,0 +1,6 @@
+# Downloaded voice packs (fetch with: node tools/download-voices.mjs <lang>)
+voices/*.zvoice
+# Harness Chrome profile (voice cache, regenerated)
+.chrome-profile/
+# Logs
+*.log
