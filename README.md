@@ -138,6 +138,7 @@ rm -rf .chrome-profile && node server.mjs 3733
 
 Requires: Node ≥22 (native `WebSocket`/`fetch`), `google-chrome-stable`,
 `ffmpeg` (mp3 only). No `npm install` (zero dependencies).
+Full platform/hardware/runtime requirements: [AGENTS.md](AGENTS.md) §0.
 
 ## Smoke test
 
