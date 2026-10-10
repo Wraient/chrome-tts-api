@@ -4,3 +4,4 @@ voices/*.zvoice
 .chrome-profile/
 # Logs
 *.log
+__pycache__

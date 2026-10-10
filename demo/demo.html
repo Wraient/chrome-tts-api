@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chrome-tts-api — read-along demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.6; margin: 0 auto; max-width: 42rem; padding: 1.5rem;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  textarea { width: 100%; min-height: 7rem; font: inherit; padding: .5rem; }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; margin: .75rem 0; }
+  select, button { font: inherit; padding: .35rem .6rem; }
+  button { cursor: pointer; }
+  #status { font-size: .85rem; opacity: .8; min-height: 1.4em; }
+  audio { width: 100%; margin: .5rem 0 1rem; }
+  #article {
+    font-size: 1.1rem; line-height: 1.9; border-top: 1px solid currentColor;
+    padding-top: 1rem; opacity: .95;
+  }
+  #article .sent { border-radius: 3px; transition: background .15s; }
+  #article .sent.active { background: rgba(230, 180, 30, .28); }
+  #article .w { border-radius: 3px; cursor: pointer; }
+  #article .w.active { background: rgba(230, 120, 20, .55); }
+  @media (prefers-reduced-motion: reduce) {
+    #article .sent { transition: none; }
+  }
+</style>
+</head>
+<body>
+<h1>Read-along demo</h1>
+<textarea id="text">We are fortunate to live at an incredible moment in history. In the next few years, people will be able to use superintelligence beyond human capacity to create extraordinary new things. The defining questions of our age are who will have access to superintelligence and what we will direct it towards.</textarea>
+<div class="row">
+  <label>Voice <select id="voice"></select></label>
+  <label>Rate <input id="rate" type="range" min="0.5" max="2" step="0.05" value="1"> <span id="ratev">1.00</span></label>
+  <label><input id="follow" type="checkbox" checked> follow</label>
+  <button id="go">Synthesize &amp; play</button>
+</div>
+<div id="status"></div>
+<audio id="player" controls></audio>
+<div id="article"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const status = (t) => { $('status').textContent = t; };
+let text = '', words = [], sentences = [], wordEls = [], sentEls = [];
+let wi = -1, si = -1, raf = 0;
+let activeWordEl = null, activeSentEl = null;
+
+$('rate').addEventListener('input', (e) => { $('ratev').textContent = Number(e.target.value).toFixed(2); });
+
+async function loadVoices() {
+  const list = await (await fetch('/voices')).json();
+  const sel = $('voice');
+  const byLang = {};
+  for (const v of list) (byLang[v.lang] ||= []).push(v);
+  for (const lang of Object.keys(byLang).sort()) {
+    const g = document.createElement('optgroup');
+    g.label = lang;
+    for (const v of byLang[lang]) {
+      const o = document.createElement('option');
+      o.value = v.name; o.textContent = v.name;
+      if (v.name === 'Google US English 1 (Natural)') o.selected = true;
+      g.appendChild(o);
+    }
+    sel.appendChild(g);
+  }
+}
+
+function b64ToBlob(b64, mime) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Blob([u8], { type: mime });
+}
+
+// Render by slicing the server's exact text at the offsets it returned, so
+// the article is character-identical to what was synthesized. Re-joining the
+// word tokens instead would invent spaces around punctuation.
+function render() {
+  const art = $('article');
+  art.innerHTML = '';
+  wordEls = []; sentEls = [];
+  wi = si = -1;
+  activeWordEl = activeSentEl = null;
+  let k = 0;
+  sentences.forEach((s, idx) => {
+    const sentEl = document.createElement('span');
+    sentEl.className = 'sent';
+    sentEls[idx] = sentEl;
+    let cursor = s.char_index;
+    while (k < words.length && words[k].char_index < s.char_end) {
+      const w = words[k];
+      if (w.char_index > cursor) {
+        sentEl.appendChild(document.createTextNode(text.slice(cursor, w.char_index)));
+      }
+      const el = document.createElement('span');
+      el.className = 'w';
+      // Clamp to the sentence span: a trailing punctuation fragment often
+      // carries whitespace that the sentence span deliberately trimmed.
+      const from = Math.max(w.char_index, s.char_index);
+      const to = Math.min(w.char_index + w.length, s.char_end);
+      el.textContent = text.slice(from, to);
+      el.addEventListener('click', () => {
+        $('player').currentTime = w.start_ms / 1000;
+        $('player').play();
+      });
+      sentEl.appendChild(el);
+      wordEls[k] = el;
+      cursor = Math.max(cursor, to);
+      k++;
+    }
+    if (cursor < s.char_end) {
+      sentEl.appendChild(document.createTextNode(text.slice(cursor, s.char_end)));
+    }
+    art.appendChild(sentEl);
+    // keep inter-sentence spacing from the source text
+    const next = sentences[idx + 1];
+    if (next && next.char_index > s.char_end) {
+      art.appendChild(document.createTextNode(text.slice(s.char_end, next.char_index)));
+    }
+  });
+}
+
+// Sentence index for a time in ms, via binary search over sentence starts.
+function sentenceAt(ms) {
+  let lo = 0, hi = sentences.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (sentences[mid].start_ms <= ms) { ans = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return ans;
+}
+
+function tick() {
+  const t = $('player').currentTime * 1000;
+  if (!words.length) return;
+  let nwi = wi;
+  if (nwi < 0 || t < words[Math.max(0, nwi)].start_ms) nwi = 0;
+  while (nwi + 1 < words.length && words[nwi + 1].start_ms <= t) nwi++;
+  while (nwi > 0 && words[nwi].start_ms > t) nwi--;
+  if (nwi !== wi) {
+    wi = nwi;
+    // Track the highlighted elements directly. After a seek `wi` is reset to
+    // -1, so wordEls[wi] is undefined and the old highlight would never be
+    // cleared — leaving several words highlighted at once.
+    const el = wordEls[wi];
+    if (el === activeWordEl) { /* unchanged */ }
+    else {
+      activeWordEl?.classList.remove('active');
+      activeWordEl = el || null;
+      activeWordEl?.classList.add('active');
+    }
+    const nsi = sentenceAt(words[wi].start_ms);
+    if (nsi !== si || sentEls[nsi] !== activeSentEl) {
+      activeSentEl?.classList.remove('active');
+      si = nsi;
+      activeSentEl = sentEls[si] || null;
+      activeSentEl?.classList.add('active');
+      if (activeSentEl && $('follow').checked) {
+        activeSentEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    }
+  }
+  raf = requestAnimationFrame(tick);
+}
+
+$('player').addEventListener('play', () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(tick); });
+$('player').addEventListener('pause', () => cancelAnimationFrame(raf));
+$('player').addEventListener('seeked', () => { wi = -1; });
+
+$('go').addEventListener('click', async () => {
+  const input = $('text').value.trim();
+  if (!input) return;
+  cancelAnimationFrame(raf);
+  $('go').disabled = true;
+  status('synthesizing…');
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: input, voice: $('voice').value,
+        rate: Number($('rate').value), format: 'json',
+      }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    text = d.text;
+    words = d.words; sentences = d.sentences;
+    render();
+    $('player').src = URL.createObjectURL(b64ToBlob(d.audio_base64, d.mime));
+    await $('player').play();
+    status(`${d.words.length} words, ${d.sentences.length} sentences, ` +
+      `${(d.duration_ms / 1000).toFixed(1)}s audio in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    status('error: ' + e.message);
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+loadVoices();
+</script>
+</body>
+</html>

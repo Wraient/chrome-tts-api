@@ -99,12 +99,67 @@ curl -s -X POST http://127.0.0.1:3733/tts \
 | `rate` | `1` | 0.1–10 |
 | `pitch` | `1` | 0.25–2 |
 | `volume` | `1` | 0–1, applied in post |
-| `format` | `wav` | `wav` (24 kHz mono s16) \| `mp3` \| `json` |
+| `format` | `wav` | `wav` (24 kHz mono s16) \| `mp3` \| `timings` \| `json` |
+| `pause_sentence` | `220` | ms of silence after a same-paragraph sentence; `0` opts out |
+| `pause_paragraph` | `500` | ms after a sentence a blank line follows |
+| `pause_heading` | `700` | ms after a heading |
 
 `format: json` returns
-`{audio_base64, mime, sample_rate, duration_ms, voice, rate, pitch,
-words: [{word, start_ms, end_ms, char_index, length}]}` —
+`{audio_base64, mime, sample_rate, duration_ms, voice, rate, pitch, text,
+pauses, pauses_ms,
+words: [{word, start_ms, end_ms, char_index, length}],
+sentences: [{text, start_ms, end_ms, char_index, char_end, break_after}]}` —
 everything a read-along-highlighting UI needs.
+`format: timings` returns the same thing **without** `audio_base64`/`mime`.
+
+**The engine is gapless.** It trims its own trailing silence, so audio has 0 ms
+of pause between everything; punctuation does not add any. Pauses are inserted
+into the PCM in `server.mjs`, sized by each sentence's `break_after` tag
+(`sentence` / `paragraph` / `heading`). Timestamps are remapped by the same
+plan, so timings and audio always agree. Defaults are on; pass `0` for any
+class to get the original rendering back.
+
+A blank line in `text` is a hard sentence boundary — that is what stops a
+heading, which has no terminal punctuation, merging into the next paragraph.
+
+**Build read-aloud UIs from `char_index`, not from `word`.** `text` is the
+exact string those offsets index into, so `text.slice(start, end)`
+reconstructs the source character-for-character. Re-joining `word` tokens
+invents spaces around punctuation (`history . In`), because the engine emits
+punctuation both standalone-with-whitespace (`'. '`) and glued (`'Dr.'`).
+Sentence spans tile the text: gaps hold whitespace only, list markers attach to
+the sentence they introduce. During playback, binary-search `words`/`sentences`
+on `start_ms` each frame, and hold a reference to the highlighted element —
+clearing by index leaves stale highlights after a seek.
+
+## 3a. PDFs
+
+```bash
+python3 tools/pdf-to-text.py FILE_OR_URL -o out.txt --report
+python3 tools/pdf-to-text.py card.pdf --pages 8-20 -o chapter.txt   # one chapter
+```
+
+Then POST the result to `/tts` normally — no engine change is needed. A line
+break costs 0 ms versus a space, so the engine reads PDF text fine; the work is
+in extraction, because page numbers, hyphenated line breaks, `●` markers and
+zero-width spaces all survive into speech. The cleaner reflows paragraphs
+(needs `pdftotext -layout`), drops the TOC and running headers, and keeps
+section headings. Tables in slide-style PDFs are images — only captions are
+readable, and OCR is not wired up.
+
+Check any extractor output before shipping it to a player:
+`python3 tools/verify-article.py out.txt` (want `PROBLEMS: 0`).
+
+**Long texts take a long time — plan the client around it.** ~6× realtime
+means a 20k-word article is ~145 min of audio and ~25 min of wall time. The
+server lifts Node's default 5-minute `requestTimeout`, so the *client* must set
+its own (curl: `--max-time 3600`; Python: `urlopen(..., timeout=7200)`).
+Prefer `format: "timings"` when the audio goes to a file — a long article
+renders to hundreds of MB of WAV that would otherwise be base64'd through RAM.
+
+Ready-made reference client: `curl -s localhost:3733/demo` (paste text,
+**Synthesize & play**, spoken sentence + word highlight in place).
+Alignment logic is pure and separately tested: `node tools/test-sentences.mjs`.
 
 ## 4. Performance rules of thumb
 

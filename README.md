@@ -36,6 +36,11 @@ bit-for-bit what Chrome ships.
 | `voices.upstream.json` | Pack catalog (66 packs, 217 speakers) copied from the engine. |
 | `voices/*.zvoice` | Downloaded voice packs (gitignored). |
 | `tools/download-voices.mjs` | Pack downloader with sha256 verify. |
+| `tools/test-sentences.mjs` | Sentence-segmentation + pause regression tests. No deps, no server/Chrome needed. |
+| `tools/pdf-to-text.py` | PDF → narration-ready prose (needs `pdftotext`). |
+| `tools/verify-article.py` | End-to-end alignment check for a real article against a running server. |
+| `lib/sentences.mjs` | Pure alignment: `splitText`, `wordsFrom`, `sentencesFrom`. |
+| `demo/demo.html` | Read-along demo (sentence + word highlighting). Served at `GET /demo`. |
 | `.chrome-profile/` | Harness Chrome profile; persists installed voices (IDBFS). |
 | `sample.wav` | Demo output (`Google US English 1 (Natural)`). |
 | `AGENTS.md` | Operator manual for AI agents: boot, synthesize, voices, troubleshooting. |
@@ -77,19 +82,146 @@ Base `http://127.0.0.1:3733` (localhost only).
 | `GET /health` | `{ok, ready, installedLangs, voices}` |
 | `GET /voices[?lang=en-us]` | 217-entry catalog: `{name, lang, gender, speaker, pack}` |
 | `POST /tts` | `{text, voice?, rate?, pitch?, volume?, format?}` → audio |
+| `GET /demo` | Read-along demo page (synthesis + sentence/word highlighting). |
 | `POST /debug` | Dev only: `{js, await?}` → CDP eval result in harness page |
 
 `/tts` params: `voice` = full name from `/voices` (default
 `Google US English 1 (Natural)`); `rate` 0.1–10 (default 1);
-`pitch` 0.25–2 (default 1); `volume` 0–1 (default 1, applied in post).
+`pitch` 0.25–2 (default 1); `volume` 0–1 (default 1, applied in post);
+`pause_sentence` 220 / `pause_paragraph` 500 / `pause_heading` 700 (ms, see
+Pauses below — pass 0 to opt out).
 `format`: `wav` (default, 24 kHz mono s16) → `audio/wav` bytes;
-`mp3` → `audio/mpeg` via ffmpeg; `json` → see below.
+`mp3` → `audio/mpeg` via ffmpeg; `timings` → alignment only, no audio;
+`json` → alignment plus `audio_base64` (WAV).
 
 `format: json` returns
 `{audio_base64 (wav), mime, sample_rate, duration_ms, voice, rate, pitch,
-words: [{word, start_ms, end_ms, char_index, length}]}`.
-Long texts are sentence-chunked (~1200 chars) and concatenated with
-offset-corrected timings; synthesis runs ~6× realtime.
+text, pauses, pauses_ms, words: [...], sentences: [...]}`.
+`format: timings` returns the same payload minus `audio_base64`/`mime`.
+
+Long texts are chunked (~1200 chars) and concatenated with offset-corrected
+timings; synthesis runs ~6× realtime.
+
+> **Long requests.** Node's `server.requestTimeout` defaults to 5 minutes and
+> would abort every real article (a 145-minute essay renders for ~25 minutes),
+> so it is set to `0` and the client owns its timeout. Use `format: "timings"`
+> when you keep the audio in a file: a long article renders to hundreds of MB
+> of WAV, which base64 inflates by a third and buffers in RAM on both ends.
+> Callers that need a bounded request should use the async job pattern
+> (`POST /jobs` → poll), which is also required behind Cloudflare Workers.
+
+### Pauses (`pause_sentence` / `pause_paragraph` / `pause_heading`)
+
+**The engine reads with no silence at all.** `harness/api.js` trims trailing
+zeros from each chunk, so audio is gapless — sentence to sentence, heading to
+body. Measured: gaps of exactly 0 ms everywhere, and punctuation does not help
+(an ellipsis and an em-dash both still measure 0 ms).
+
+Silence is therefore inserted into the PCM in `server.mjs`, sized by what
+follows each sentence. Every sentence carries a `break_after` tag:
+
+| `break_after` | meaning | default |
+|---|---|---|
+| `sentence` | next sentence continues the same paragraph | `pause_sentence` = 220 ms |
+| `paragraph` | a blank line follows | `pause_paragraph` = 500 ms |
+| `heading` | this sentence is a heading and a blank line follows | `pause_heading` = 700 ms |
+
+Defaults are **on**. Pass `0` for any of them to opt out and get the engine's
+original gapless rendering back. Timestamps are remapped by the same plan that
+places the gaps (`new_t = t + Σ pauses before t`), so words, sentences and audio
+cannot drift apart — and with `format: "timings"` the remap runs without
+rebuilding the audio, keeping long documents memory-flat.
+
+A blank line in `text` is a hard sentence boundary. That is what keeps a
+heading like `Executive summary` — which carries no terminal punctuation — from
+merging into the paragraph after it.
+
+### Read-along alignment (`text` + `words` + `sentences`)
+
+This is what powers a Chrome-style "listen to this page" UI: highlighting the
+sentence (or word) currently being spoken. Chrome's Read Aloud keeps text and
+audio in sync via the same word timepoints we scrape from the engine.
+
+```jsonc
+{
+  "text": "Dr. Smith went to Washington. He arrived!",  // exact string synthesized
+  "words": [
+    { "word": "Dr.",  "start_ms": 15,  "end_ms": 410,  "char_index": 0,  "length": 3 }
+  ],
+  "sentences": [
+    { "text": "Dr. Smith went to Washington.", "start_ms": 15,   "end_ms": 2100,
+      "char_index": 0, "char_end": 28 }
+  ]
+}
+```
+
+**Render from `char_index`, not from `word`.** `text` is the exact string the
+offsets index into; slicing it reproduces the source character-for-character.
+Re-joining the `word` tokens instead invents spaces around punctuation
+(`history . In`), because the engine emits punctuation both as standalone
+fragments carrying whitespace (`'. '`) and glued to words (`'Dr.'`).
+
+Sentence spans are contiguous and ordered: joining `text[char_index:char_end]`
+with single spaces reconstructs the input, no inter-sentence gap holds real
+characters, and nothing real is left before the first or after the last span.
+`char_index`/`char_end` also index `words`, so a word belongs to the sentence
+whose range contains its start. List markers (`. - `, `. — `) are attached to
+the sentence they introduce, never left dangling in a gap.
+
+To highlight during playback, binary-search `words`/`sentences` on `start_ms`
+each `requestAnimationFrame` — do **not** clear the previous highlight by index
+(`wordEls[wi]`), because seeking resets the index and leaves stale highlights;
+hold a reference to the highlighted element instead (see `demo/demo.html`).
+
+Known limits: abbreviations not in the built-in list (`U.S.`, `Ph.D.`) may end a
+sentence slightly early, and `Jan. 5th`-style ordinals split after the month.
+Both only shift a highlight boundary by a few words.
+
+## PDFs
+
+```bash
+python3 tools/pdf-to-text.py FILE_OR_URL -o out.txt --report
+python3 tools/pdf-to-text.py card.pdf --pages 8-20 -o chapter.txt
+```
+
+Then `POST /tts` as usual — PDF-derived text needs nothing special.
+
+The engine itself does not care where text came from: a hard line break costs
+**0 ms** versus a space, and sentences already span line breaks correctly. The
+work is in extraction, because a PDF text layer is laid out for sight and four
+of its artifacts get *spoken*:
+
+| Artifact | Consequence if passed through as-is |
+|---|---|
+| Page numbers (last line of every page) | "…on it. **30** The task begins now" — read aloud as "thirty" |
+| Hyphenated line breaks (`con-\nntinue`) | word split mid-token, mispronounced |
+| List markers (`●`) | marker carried into the sentence text |
+| Zero-width spaces (U+200B) | glues to bullets and headings; shifts every char offset |
+
+So `pdf-to-text.py` reflows: NFKC normalization (folds ligatures), zero-width
+removal, de-hyphenation, and unwrapping of paragraph lines — using
+`pdftotext -layout`, which preserves the vertical gaps that mark paragraphs.
+Plain mode emits no blank lines at all (6% blank vs 26%), and without them
+nothing downstream can tell a heading from body text.
+
+It also drops the table of contents (pages whose lines are >30% page-number
+entries — measured 0.97–1.00 on TOC pages vs 0.02–0.06 on prose; a 10-line
+floor stops figure pages with captions being misread as TOC) and running
+headers/footers, while keeping section headings.
+
+Two limitations worth knowing:
+
+- **Tables in slide-style PDFs are images.** Only captions like
+  `[Table 2.2.1.A]` reach the text layer; the numbers are absent and skipped.
+  Recovering them needs OCR, which is not wired up.
+- **Requires `pdftotext`** (poppler-utils). In the HF Space image add
+  `apt-get install poppler-utils`, or port the cleaner to `pdfplumber`.
+
+Verify any extractor's output before wiring it to a player:
+
+```bash
+python3 tools/verify-article.py out.txt   # PROBLEMS: 0 expected
+```
 
 ```bash
 curl -X POST localhost:3733/tts -H 'Content-Type: application/json' \
@@ -98,7 +230,8 @@ curl -X POST localhost:3733/tts -H 'Content-Type: application/json' \
 
 ## Wired clients
 
-None yet — any HTTP client works. Planned: a small web UI for paste-and-listen.
+None yet — any HTTP client works. The bundled `GET /demo` page is the reference
+client for the read-aloud/alignment path.
 
 ## Troubleshooting
 
@@ -120,6 +253,10 @@ None yet — any HTTP client works. Planned: a small web UI for paste-and-listen
    port-relative; no other config needed).
 7. **Stale/broken voice cache** — `rm -rf .chrome-profile` (voices re-install
    from local `voices/` on next request).
+8. **Client drops a long request after ~5 min** — the *client's* timeout, not
+   the server's. Raise it (`curl --max-time 3600`) and switch to
+   `format: "timings"`. A `RemoteDisconnected`/`ReadTimeout` on a full article
+   means the client gave up, not that synthesis failed.
 
 ## Rebuild / reinstall steps
 
@@ -143,17 +280,32 @@ Full platform/hardware/runtime requirements: [AGENTS.md](AGENTS.md) §0.
 ## Smoke test
 
 ```bash
+# alignment logic (no server or Chrome needed)
+node tools/test-sentences.mjs
+# ALL PASS (28 checks across 14 cases)
+
+# live server
 curl -s localhost:3733/health
 # {"ok":true,"ready":true,"installedLangs":["en-us"],"voices":217}
 curl -s -X POST localhost:3733/tts -H 'Content-Type: application/json' \
   -d '{"text":"The quick brown fox.","format":"json"}' | \
-  python3 -c "import json,sys; d=json.load(sys.stdin); print(d['sample_rate'], d['duration_ms'], len(d['words']))"
-# 24000 1596 4
+  python3 -c "import json,sys; d=json.load(sys.stdin); print(d['sample_rate'], d['duration_ms'], len(d['words']), len(d['sentences']))"
+# 24000 1596 4 1
 ```
+
+Read-aloud UI: open <http://127.0.0.1:3733/demo>, paste text, click
+**Synthesize & play** — the spoken sentence and word are highlighted in place.
 
 Verified 2026-10-09 on Chrome 154.0.8037.97: 1739-char article →
 97.4 s audio in 16.9 s wall (~5.7× realtime), 322 timestamped words;
 WAV levels healthy (peak 22079, RMS 3379); MP3 transcode OK.
+Alignment verified on a 2159-char / 2-chunk input → 60 sentences, monotonic
+timings, spans reconstructing the input exactly.
+PDF path verified end-to-end on a 4-page letter (1539 words) and a 13-page
+chapter of the Haiku system card (3115 words): `PROBLEMS: 0` for both, with
+pause gaps measured in the PCM at exactly 700/220/500 ms. Full system card
+(145 pages, 31,943 words, ~213 min audio) extracts clean; TOC pages 4-7 and
+139 page numbers dropped, figure captions kept.
 
 ## Appendix: how "Listen to this page" actually works (all platforms)
 

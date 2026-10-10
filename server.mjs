@@ -5,14 +5,17 @@
 //   node server.mjs [port]            # default 3733
 //   GET  /voices                      # JSON voice catalog
 //   GET  /health                      # { ok, ready, installedLangs }
-//   POST /tts  {text, voice?, rate?, pitch?, volume?, format?}
-//        format: wav (default) | mp3 | json (audio_base64 + words)
+//   POST /tts  {text, voice?, rate?, pitch?, volume?, format?, pause_*?}
+//        format: wav (default) | mp3 | json (audio_base64 + words) | timings
+//        pause_sentence/paragraph/heading: ms of silence after a sentence,
+//        based on what follows it. Defaults 220/500/700; 0 opts out.
 import { spawn, execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import { splitText, wordsFrom, sentencesFrom, pausePlan, DEFAULT_PAUSES } from './lib/sentences.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] || process.env.PORT || 3733);
@@ -45,6 +48,15 @@ function handleStatic(req, res) {
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(local));
+      return true;
+    }
+    if (url.pathname === '/demo' || url.pathname === '/') {
+      res.writeHead(200, {
+        'Content-Type': 'text/html',
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cross-Origin-Embedder-Policy': 'require-corp',
+      });
+      res.end(readFileSync(join(root, 'demo', 'demo.html')));
       return true;
     }
     let file;
@@ -184,48 +196,41 @@ async function ensureLang(lang) {
   installedLangs.add(lang);
 }
 
+// --- silence -----------------------------------------------------------------
+// The engine trims its own trailing silence (harness/api.js) and renders
+// gapless, so pauses are inserted here. `pauses` is [{atMs, ms}], ascending.
+function insertPauses(i16, sampleRate, pauses) {
+  if (!pauses.length) return i16;
+  const gapSamples = pauses.map((p) => Math.round((p.ms * sampleRate) / 1000));
+  const extra = gapSamples.reduce((a, b) => a + b, 0);
+  const out = new Int16Array(i16.length + extra); // zero-filled = silence
+  let src = 0, dst = 0;
+  for (let i = 0; i < pauses.length; i++) {
+    const at = Math.min(i16.length, Math.max(src, Math.round((pauses[i].atMs * sampleRate) / 1000)));
+    if (at > src) { out.set(i16.subarray(src, at), dst); dst += at - src; }
+    src = at;
+    dst += gapSamples[i];
+  }
+  out.set(i16.subarray(src), dst);
+  return out;
+}
+
+// Map a pre-pause timestamp to the audio that actually contains it. A pause sits
+// exactly at its sentence's end, so it counts for that timestamp too.
+function makeRemap(pauses) {
+  if (!pauses.length) return (t) => t;
+  const at = pauses.map((p) => p.atMs);
+  const cum = [0];
+  for (const p of pauses) cum.push(cum[cum.length - 1] + p.ms);
+  return (t) => {
+    let lo = 0, hi = at.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (at[mid] <= t) lo = mid + 1; else hi = mid; }
+    return t + cum[lo];
+  };
+}
+
 // --- synthesis ---------------------------------------------------------------
-const MAX_CHUNK = 1200;
-function splitText(text) {
-  const parts = String(text).split(/(?<=[.!?;:\n])\s+/);
-  const chunks = [];
-  let cur = '';
-  for (const p of parts) {
-    if ((cur + ' ' + p).trim().length > MAX_CHUNK && cur) { chunks.push(cur.trim()); cur = p; }
-    else cur = cur ? cur + ' ' + p : p;
-  }
-  if (cur.trim()) chunks.push(cur.trim());
-  // map chunk -> char offset in the joined text we actually synthesize
-  let off = 0;
-  return chunks.map((c) => {
-    const o = { text: c, start: off };
-    off += c.length + 1;
-    return o;
-  });
-}
-
-function wordsFrom(fullText, chunks, results) {
-  const words = [];
-  for (let ci = 0; ci < chunks.length; ci++) {
-    const { start: charBase, msBase } = chunks[ci];
-    const tps = results[ci].timepoints;
-    for (let i = 0; i < tps.length; i++) {
-      const tp = tps[i];
-      const next = tps[i + 1];
-      const startMs = msBase + tp.t * 1000;
-      words.push({
-        word: fullText.substr(charBase + tp.i, tp.l),
-        start_ms: Math.round(startMs),
-        end_ms: Math.round(next ? msBase + next.t * 1000 : msBase + results[ci].ms),
-        char_index: charBase + tp.i,
-        length: tp.l,
-      });
-    }
-  }
-  // The engine also emits pause/whitespace fragments; API consumers want words.
-  return words.filter((w) => w.word.trim().length > 0);
-}
-
+// splitText / wordsFrom / sentencesFrom live in lib/sentences.mjs (pure, tested).
 function wavBuffer(i16, sampleRate) {
   const h = Buffer.alloc(44);
   h.write('RIFF', 0); h.writeUInt32LE(36 + i16.byteLength, 4); h.write('WAVE', 8);
@@ -248,9 +253,11 @@ function mp3Buffer(i16, sampleRate) {
   });
 }
 
-async function synthesize(text, { voice, rate, pitch, volume }) {
+async function synthesize(text, { voice, rate, pitch, volume }, { keepAudio = true, durations = DEFAULT_PAUSES } = {}) {
   const chunks = splitText(text);
-  const fullText = chunks.map((c) => c.text).join(' ');
+  // The exact string we synthesized. Chunk offsets index into this, so it must
+  // be the input verbatim — not a reconstruction from the chunk texts.
+  const fullText = String(text);
   const results = [];
   let ms = 0;
   const i16parts = [];
@@ -259,17 +266,39 @@ async function synthesize(text, { voice, rate, pitch, volume }) {
       `window.__ttsSpeak(${JSON.stringify(c.text)}, ${JSON.stringify({ voiceName: voice, rate, pitch, volume })})`);
     if (!r || !r.pcm16Base64) throw new Error('empty synthesis result');
     const raw = Buffer.from(r.pcm16Base64, 'base64');
-    i16parts.push(new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2));
     c.msBase = ms;
     const durMs = (raw.byteLength / 2 / 24000) * 1000;
+    if (keepAudio) i16parts.push(new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2));
     results.push({ timepoints: r.timepoints || [], ms: durMs });
     ms += durMs;
   }
-  const total = i16parts.reduce((n, p) => n + p.length, 0);
-  const i16 = new Int16Array(total);
-  let o = 0;
-  for (const p of i16parts) { i16.set(p, o); o += p.length; }
-  return { i16, sampleRate: 24000, durationMs: Math.round(ms), words: wordsFrom(fullText, chunks, results) };
+  // Alignment-only callers skip this: a 2-hour article is ~700 MB of PCM, and
+  // holding both the parts and the joined copy doubles it for nothing.
+  let i16 = null;
+  if (keepAudio) {
+    const total = i16parts.reduce((n, p) => n + p.length, 0);
+    i16 = new Int16Array(total);
+    let o = 0;
+    for (const p of i16parts) { i16.set(p, o); o += p.length; }
+  }
+  const words = wordsFrom(fullText, chunks, results);
+  const sentences = sentencesFrom(fullText, words);
+  // Pause sizing comes from the sentences alone, so the timings below and the
+  // audio agree on exactly where the gaps are.
+  const pauses = pausePlan(sentences, durations);
+  const remap = makeRemap(pauses);
+  if (i16) {
+    i16 = insertPauses(i16, 24000, pauses);
+    i16parts.length = 0; // release the per-chunk copies before the caller builds on this
+  }
+  for (const w of words) { w.start_ms = Math.round(remap(w.start_ms)); w.end_ms = Math.round(remap(w.end_ms)); }
+  for (const s of sentences) { s.start_ms = Math.round(remap(s.start_ms)); s.end_ms = Math.round(remap(s.end_ms)); }
+  return {
+    i16, sampleRate: 24000,
+    durationMs: Math.round(remap(Math.round(ms))),
+    pauses_ms: pauses.reduce((n, p) => n + p.ms, 0),
+    text: fullText, words, sentences,
+  };
 }
 
 // --- HTTP API ------------------------------------------------------------------
@@ -315,19 +344,42 @@ const server = createServer(async (req, res) => {
     const pitch = Math.min(2, Math.max(0.25, Number(q.pitch ?? 1) || 1));
     const volume = Math.min(1, Math.max(0, Number(q.volume ?? 1)));
     const format = (q.format || url.searchParams.get('format') || 'wav').toLowerCase();
+    // Silence after a sentence, by what follows it. Defaults on; pass 0 to opt
+    // out of any class and get the engine's original gapless rendering back.
+    const num = (v, d) => {
+      const n = Number(v);
+      return Number.isFinite(n) && v !== undefined && v !== null && v !== '' ? Math.max(0, n) : d;
+    };
+    const pauses = {
+      sentence: num(q.pause_sentence, DEFAULT_PAUSES.sentence),
+      paragraph: num(q.pause_paragraph, DEFAULT_PAUSES.paragraph),
+      heading: num(q.pause_heading, DEFAULT_PAUSES.heading),
+    };
     try {
       const out = await serialized(async () => {
         await ensureLang(lang);
-        return synthesize(text, { voice, rate, pitch, volume });
+        return synthesize(text, { voice, rate, pitch, volume },
+                         { keepAudio: format !== 'timings', durations: pauses });
       });
-      if (format === 'json') {
+      const meta = {
+        duration_ms: out.durationMs, sample_rate: out.sampleRate,
+        // The exact string word/sentence char offsets index into, so clients
+        // can render highlights by slicing this instead of reassembling
+        // tokens (which would lose original whitespace).
+        text: out.text,
+        pauses, pauses_ms: out.pauses_ms,
+        voice, rate, pitch, words: out.words, sentences: out.sentences,
+      };
+      if (format === 'timings') {
+        // Metadata only, no audio. A long article renders to hundreds of MB of
+        // WAV, which base64-inflates further; callers that keep the audio in a
+        // file (the usual HF/R2 pipeline) only need the alignment.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(meta));
+      } else if (format === 'json') {
         const audio = wavBuffer(out.i16, out.sampleRate);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          audio_base64: audio.toString('base64'), mime: 'audio/wav',
-          sample_rate: out.sampleRate, duration_ms: out.durationMs,
-          voice, rate, pitch, words: out.words,
-        }));
+        res.end(JSON.stringify({ ...meta, audio_base64: audio.toString('base64'), mime: 'audio/wav' }));
       } else if (format === 'mp3') {
         const mp3 = await mp3Buffer(out.i16, out.sampleRate);
         res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
@@ -345,6 +397,13 @@ const server = createServer(async (req, res) => {
   if (handleStatic(req, res)) return;
   res.writeHead(404); res.end('not found');
 });
+
+// Node aborts a request after 5 minutes by default (requestTimeout), which
+// every real article blows through — a 145-minute essay renders for ~25
+// minutes. Synthesis is deliberately long-running, so the cap is lifted and
+// the client owns its own timeout instead.
+server.requestTimeout = 0;
+server.headersTimeout = 0;
 
 process.on('SIGINT', () => { chromeProc?.kill(); process.exit(0); });
 process.on('SIGTERM', () => { chromeProc?.kill(); process.exit(0); });
